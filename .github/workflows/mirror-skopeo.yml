@@ -1,0 +1,66 @@
+name: Mirror GHCR openclaw/openclaw -> Docker Hub
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes
+  workflow_dispatch: {}
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install tools (skopeo + jq)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      - name: Login to Docker Hub (for push)
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$DOCKERHUB_TOKEN" | skopeo login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin
+
+      # Optional: login to GHCR (only needed if GHCR requires auth)
+      - name: Login to GHCR (optional)
+        if: ${{ secrets.GHCR_TOKEN != '' }}
+        env:
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | skopeo login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+
+      - name: Mirror missing tags (multi-arch preserved)
+        env:
+          SRC_REPO: ghcr.io/openclaw/openclaw
+          DST_REPO: docker.io/openclaw/openclaw
+        run: |
+          set -euo pipefail
+
+          echo "Fetching tags from source: $SRC_REPO"
+          SRC_TAGS_JSON="$(skopeo list-tags docker://$SRC_REPO)"
+          SRC_TAGS="$(echo "$SRC_TAGS_JSON" | jq -r '.Tags[]' | sort -V)"
+
+          echo "Fetching tags from destination: $DST_REPO"
+          DST_TAGS_JSON="$(skopeo list-tags docker://$DST_REPO || echo '{\"Tags\":[]}')"
+          DST_TAGS="$(echo "$DST_TAGS_JSON" | jq -r '.Tags[]?' | sort -V)"
+
+          # Compute tags in SRC but not in DST
+          MISSING="$(comm -23 <(echo "$SRC_TAGS") <(echo "$DST_TAGS") || true)"
+
+          if [ -z "$MISSING" ]; then
+            echo "No new tags to mirror."
+            exit 0
+          fi
+
+          echo "Missing tags to mirror:"
+          echo "$MISSING"
+
+          for TAG in $MISSING; do
+            echo "Mirroring tag: $TAG"
+            skopeo copy --all \
+              "docker://$SRC_REPO:$TAG" \
+              "docker://$DST_REPO:$TAG"
+          done
